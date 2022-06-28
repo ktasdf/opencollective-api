@@ -25,7 +25,7 @@ import { enrichActivity, sanitizeActivity } from './webhooks';
 
 const debug = debugLib('notifications');
 
-export default async (activity: Activity) => {
+const notify = async (activity: Activity) => {
   notifyByEmail(activity).catch(console.log);
 
   // process notification entries for slack, twitter, gitter
@@ -50,7 +50,7 @@ export default async (activity: Activity) => {
   };
 
   const notificationChannels = await models.Notification.findAll({ where });
-  return Promise.map(notificationChannels, notifConfig => {
+  return Promise.map(notificationChannels, async notifConfig => {
     if (notifConfig.channel === channels.GITTER) {
       return publishToGitter(activity, notifConfig);
     } else if (notifConfig.channel === channels.SLACK) {
@@ -59,8 +59,6 @@ export default async (activity: Activity) => {
       return twitter.tweetActivity(activity);
     } else if (notifConfig.channel === channels.WEBHOOK) {
       return publishToWebhook(activity, notifConfig.webhookUrl);
-    } else {
-      return Promise.resolve();
     }
   }).catch(err => {
     reportErrorToSentry(err);
@@ -160,51 +158,6 @@ async function notifyUserId(
 ) {
   const user = await models.User.findByPk(UserId);
   debug('notifyUserId', UserId, user && user.email, activity.type);
-
-  if (activity.type === ActivityTypes.TICKET_CONFIRMED) {
-    const event = await models.Collective.findByPk(activity.data.EventCollectiveId);
-    const parentCollective = await event.getParentCollective();
-    const ics = await event.getICS();
-    options.attachments = [{ filename: `${event.slug}.ics`, content: ics }];
-
-    const transaction = await models.Transaction.findOne({
-      where: { OrderId: activity.data.order.id, type: TransactionTypes.CREDIT, kind: TransactionKind.CONTRIBUTION },
-    });
-
-    if (transaction) {
-      const transactionPdf = await getTransactionPdf(transaction, user);
-      if (transactionPdf) {
-        const createdAtString = toIsoDateStr(transaction.createdAt ? new Date(transaction.createdAt) : new Date());
-        options.attachments.push({
-          filename: `transaction_${event.slug}_${createdAtString}_${transaction.uuid}.pdf`,
-          content: transactionPdf,
-        });
-        activity.data.transactionPdf = true;
-      }
-
-      if (transaction.hasPlatformTip()) {
-        const platformTipTransaction = await transaction.getPlatformTipTransaction();
-
-        if (platformTipTransaction) {
-          const platformTipPdf = await getTransactionPdf(platformTipTransaction, user);
-
-          if (platformTipPdf) {
-            const createdAtString = toIsoDateStr(new Date(platformTipTransaction.createdAt));
-            options.attachments.push({
-              filename: `transaction_opencollective_${createdAtString}_${platformTipTransaction.uuid}.pdf`,
-              content: platformTipPdf,
-            });
-            activity.data.platformTipPdf = true;
-          }
-        }
-      }
-    }
-    activity.data.event = event.info;
-    activity.data.isOffline = activity.data.event.locationName !== 'Online';
-    activity.data.collective = parentCollective.info;
-    options.from = `${parentCollective.name} <no-reply@${parentCollective.slug}.opencollective.com>`;
-  }
-
   return emailLib.send(activity.type, options.to || user.email, activity.data, options);
 }
 
@@ -242,20 +195,18 @@ export async function notifyAdminsAndAccountantsOfCollective(
     );
   }
 
-  let usersToNotify = [];
-  if (collective.type === CollectiveType.USER && !collective.isIncognito) {
-    // Incognito profiles rely on the `Members` entry to know which user it belongs to
-    usersToNotify = [await collective.getUser()];
-  } else {
-    usersToNotify = await collective.getMembersUsers({
-      CollectiveId: collective.ParentCollectiveId ? [collective.ParentCollectiveId, collective.id] : collective.id,
-      role: [roles.ACCOUNTANT, roles.ADMIN],
-    });
-  }
+  const isIncognitoUser = collective.type === CollectiveType.USER && !collective.isIncognito;
+  let usersToNotify = isIncognitoUser
+    ? [await collective.getUser()]
+    : await collective.getMembersUsers({
+        CollectiveId: collective.ParentCollectiveId ? [collective.ParentCollectiveId, collective.id] : collective.id,
+        role: [roles.ACCOUNTANT, roles.ADMIN],
+      });
 
   if (options.exclude) {
     usersToNotify = usersToNotify.filter(u => options.exclude.indexOf(u.id) === -1);
   }
+
   debug('Total users to notify:', usersToNotify.length);
   activity.CollectiveId = collective.id;
   return notifySubscribers(usersToNotify, activity, options);
@@ -417,9 +368,54 @@ async function notifyByEmail(activity: Activity) {
       notifyUserId(activity.UserId, activity);
       break;
 
-    case ActivityTypes.TICKET_CONFIRMED:
-      notifyUserId(activity.data.UserId, activity);
+    case ActivityTypes.TICKET_CONFIRMED: {
+      const user = await models.User.findByPk(activity.UserId);
+      const event = await models.Collective.findByPk(activity.data.EventCollectiveId);
+      const parentCollective = await event.getParentCollective();
+      const ics = await event.getICS();
+      const options = {
+        attachments: [{ filename: `${event.slug}.ics`, content: ics }],
+        from: `${parentCollective.name} <no-reply@${parentCollective.slug}.opencollective.com>`,
+      };
+
+      const transaction = await models.Transaction.findOne({
+        where: { OrderId: activity.data.order.id, type: TransactionTypes.CREDIT, kind: TransactionKind.CONTRIBUTION },
+      });
+
+      if (transaction) {
+        const transactionPdf = await getTransactionPdf(transaction, user);
+        if (transactionPdf) {
+          const createdAtString = toIsoDateStr(transaction.createdAt ? new Date(transaction.createdAt) : new Date());
+          options.attachments.push({
+            filename: `transaction_${event.slug}_${createdAtString}_${transaction.uuid}.pdf`,
+            content: transactionPdf,
+          });
+          activity.data.transactionPdf = true;
+        }
+
+        if (transaction.hasPlatformTip()) {
+          const platformTipTransaction = await transaction.getPlatformTipTransaction();
+
+          if (platformTipTransaction) {
+            const platformTipPdf = await getTransactionPdf(platformTipTransaction, user);
+
+            if (platformTipPdf) {
+              const createdAtString = toIsoDateStr(new Date(platformTipTransaction.createdAt));
+              options.attachments.push({
+                filename: `transaction_opencollective_${createdAtString}_${platformTipTransaction.uuid}.pdf`,
+                content: platformTipPdf,
+              });
+              activity.data.platformTipPdf = true;
+            }
+          }
+        }
+      }
+      activity.data.event = event.info;
+      activity.data.isOffline = activity.data.event.locationName !== 'Online';
+      activity.data.collective = parentCollective.info;
+      notifyUserId(user.id, activity);
       break;
+    }
 
     case ActivityTypes.ORGANIZATION_COLLECTIVE_CREATED:
       notifyUserId(activity.UserId, activity);
@@ -733,3 +729,5 @@ async function notifyByEmail(activity: Activity) {
       break;
   }
 }
+
+export default notify;
